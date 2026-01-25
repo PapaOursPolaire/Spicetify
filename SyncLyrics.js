@@ -28,10 +28,10 @@
             },
             UPDATE_INTERVAL: 30,
             REQUEST_TIMEOUT: 10000,
-            CACHE_DURATION: 3600000, // 1 heure
+            CACHE_DURATION: 3600000, 
             DOWNLOAD_PATH: 'C:/LyricsBear',
             FALLBACK_ENABLED: true,
-            AUTO_DOWNLOAD_DEFAULT: true // NOUVEAU : téléchargement activé par défaut
+            AUTO_DOWNLOAD_DEFAULT: true 
         };
 
         let state = {
@@ -48,7 +48,7 @@
             currentSource: 'network-batch',
             isLoading: false,
             interceptedData: new Map(),
-            downloadEnabled: CONFIG.AUTO_DOWNLOAD_DEFAULT, // Par défaut activé
+            downloadEnabled: CONFIG.AUTO_DOWNLOAD_DEFAULT, 
             loadingQueue: new Set(),
             cachedTracks: new Map(),
             fallbackAttempts: new Map(),
@@ -612,8 +612,47 @@
             setupNetworkInterception() {
                 console.log('[LyricsBear] Configuration interception réseau optimisée...');
                 
+                // NOUVEAU : Bloquer les vérifications de version Beautiful Lyrics
+                const originalFetch = window.fetch;
+                window.fetch = async function(...args) {
+                    const [url] = args;
+                    
+                    // Bloquer les requêtes de version Beautiful Lyrics
+                    if (typeof url === 'string' && url.includes('extensions.socalifornian.live/version')) {
+                        console.log('[LyricsBear] ⛔ Requête de version Beautiful Lyrics bloquée');
+                        // Retourner une fausse réponse pour éviter les erreurs
+                        return new Response(JSON.stringify({ version: '1.0.0' }), {
+                            status: 200,
+                            headers: { 'Content-Type': 'application/json' }
+                        });
+                    }
+                    
+                    try {
+                        const response = await originalFetch.apply(this, args);
+                        
+                        if (state.manager && state.manager.isLyricsRequest(url)) {
+                            console.log('[LyricsBear] Requête fetch lyrics détectée:', url);
+                            const clonedResponse = response.clone();
+                            const responseText = await clonedResponse.text();
+                            state.manager.handleLyricsResponse(responseText, url);
+                        }
+                        
+                        return response;
+                    } catch (error) {
+                        console.error('[LyricsBear] Erreur fetch:', error);
+                        throw error;
+                    }
+                };
+                
+                // XHR interception reste identique
                 const originalXHR = window.XMLHttpRequest.prototype.open;
                 window.XMLHttpRequest.prototype.open = function(method, url, ...args) {
+                    // Bloquer aussi les XHR de version
+                    if (typeof url === 'string' && url.includes('extensions.socalifornian.live/version')) {
+                        console.log('[LyricsBear] ⛔ Requête XHR de version Beautiful Lyrics bloquée');
+                        this._blocked = true;
+                    }
+                    
                     this._url = url;
                     this._method = method;
                     return originalXHR.apply(this, [method, url, ...args]);
@@ -621,6 +660,16 @@
 
                 const originalSend = window.XMLHttpRequest.prototype.send;
                 window.XMLHttpRequest.prototype.send = function(data) {
+                    if (this._blocked) {
+                        // Simuler une réponse réussie
+                        setTimeout(() => {
+                            Object.defineProperty(this, 'status', { value: 200 });
+                            Object.defineProperty(this, 'responseText', { value: '{"version":"1.0.0"}' });
+                            if (this.onload) this.onload();
+                        }, 0);
+                        return;
+                    }
+                    
                     if (state.manager && state.manager.isLyricsRequest(this._url)) {
                         console.log('[LyricsBear] Requête XHR lyrics détectée:', this._url);
                         
@@ -639,46 +688,73 @@
                     
                     return originalSend.apply(this, arguments);
                 };
+            }
+
+            convertSpicyLyrics(data) {
+                console.log('[LyricsBear] 🌶️ Conversion Spicy Lyrics');
                 
-                const originalFetch = window.fetch;
-                window.fetch = async function(...args) {
-                    const [url] = args;
+                const lines = [];
+                
+                if (data.queries && data.queries[0] && data.queries[0].result && data.queries[0].result.data) {
+                    const lyricsData = data.queries[0].result.data;
                     
-                    try {
-                        const response = await originalFetch.apply(this, args);
-                        
-                        if (state.manager && state.manager.isLyricsRequest(url)) {
-                            console.log('[LyricsBear] Requête fetch lyrics détectée:', url);
-                            const clonedResponse = response.clone();
-                            const responseText = await clonedResponse.text();
-                            state.manager.handleLyricsResponse(responseText, url);
-                        }
-                        
-                        return response;
-                    } catch (error) {
-                        console.error('[LyricsBear] Erreur fetch:', error);
-                        throw error;
+                    if (lyricsData.Content && Array.isArray(lyricsData.Content)) {
+                        lyricsData.Content.forEach((item) => {
+                            if (item.Type === 'Vocal' && item.Lead && item.Lead.Syllables) {
+                                const words = item.Lead.Syllables.map(syl => ({
+                                    text: syl.Text,
+                                    startTime: syl.StartTime * 1000,
+                                    endTime: syl.EndTime * 1000
+                                }));
+                                
+                                const text = words.map(w => w.text).join(' ');
+                                
+                                lines.push({
+                                    startTime: item.Lead.StartTime * 1000,
+                                    endTime: item.Lead.EndTime * 1000,
+                                    text: text,
+                                    words: words
+                                });
+                            }
+                        });
                     }
+                }
+                
+                return {
+                    lines: lines,
+                    wordSync: lines,
+                    source: 'spicy-lyrics',
+                    hasWordSync: true
                 };
             }
 
             isLyricsRequest(url) {
                 if (!url || typeof url !== 'string') return false;
                 
+                // Exclure les vérifications de version
+                if (url.includes('/version')) {
+                    return false;
+                }
+                
                 const lyricsPatterns = [
+                    // 🌶️ SPICY LYRICS - LE TRÉSOR !!!
+                    'api.spicylyrics.org',
+                    'spicylyrics.org/query',
+                    
+                    // Reste...
                     'beautiful-lyrics.socalifornian.live/lyrics/',
                     '/color-lyrics/v2/track/',
+                    'spclient.wg.spotify.com/color-lyrics',
                     'spicy-lyrics',
                     'lyrics-plus',
-                    'spclient.wg.spotify.com/color-lyrics',
                     '/batch',
-                    'spicy-lyrics.com',
                     'lyrics.spotify.com'
                 ];
                 
                 return lyricsPatterns.some(pattern => url.includes(pattern));
             }
 
+            
             async handleLyricsResponse(responseText, url) {
                 try {
                     let data;
@@ -695,30 +771,41 @@
                     if (processedData && processedData.lines && processedData.lines.length > 0) {
                         const trackId = this.extractTrackId(url, data);
                         
+                        // NOUVEAU : Détecter la source
+                        let detectedSource = 'network-batch';
+                        if (url.includes('beautiful-lyrics')) {
+                            detectedSource = 'beautiful-lyrics';
+                            console.log('[LyricsBear] 🎵 Beautiful Lyrics intercepté !');
+                        } else if (url.includes('lrclib')) {
+                            detectedSource = 'lrclib';
+                        }
+                        
                         if (trackId) {
                             const cacheData = {
                                 data: processedData,
                                 timestamp: Date.now(),
                                 sourceUrl: url,
-                                originalData: data
+                                originalData: data,
+                                detectedSource: detectedSource
                             };
                             
                             state.interceptedData.set(trackId, cacheData);
                             
                             if (state.downloadEnabled && state.currentTrack) {
-                                await this.downloadOriginalLyrics(state.currentTrack, data, 'network-batch');
+                                await this.downloadOriginalLyrics(state.currentTrack, data, detectedSource);
                             }
                             
                             if (this.isCurrentTrackId(trackId)) {
                                 state.lyrics = processedData.lines;
                                 state.wordSyncData = processedData.wordSync;
+                                state.currentSource = detectedSource;
                                 
                                 if (state.isVisible) {
                                     this.displayLyrics(state.lyrics);
                                 }
                                 
-                                this.updateSourceStatus('network-batch', 'success');
-                                this.updateStatusInfo(`Paroles réseau synchronisées ${processedData.hasWordSync ? 'mot par mot' : 'ligne par ligne'}`);
+                                this.updateSourceStatus(detectedSource, 'success');
+                                this.updateStatusInfo(`Paroles ${detectedSource} synchronisées ${processedData.hasWordSync ? 'mot par mot' : 'ligne par ligne'}`);
                             }
                         }
                     }
@@ -805,6 +892,14 @@
             }
 
             processLyricsData(data, sourceUrl) {
+                console.log('[LyricsBear] processLyricsData, sourceUrl:', sourceUrl);
+                
+                if (sourceUrl && sourceUrl.includes('spicylyrics.org')) {
+                    console.log('[LyricsBear] 🌶️ SPICY LYRICS DÉTECTÉ !');
+                    return this.convertSpicyLyrics(data);
+                }
+                
+                // Batch Spotify
                 if (data.jobs && Array.isArray(data.jobs)) {
                     for (const job of data.jobs) {
                         if (job.handler === 'LYRICS_ID' && job.result && job.result.responseData) {
@@ -817,6 +912,7 @@
                     return this.convertBatchToLyrics(data);
                 }
                 
+                // Beautiful Lyrics
                 if (data.lyrics || data.lines) {
                     return this.convertBeautifulLyrics(data);
                 }
@@ -905,7 +1001,6 @@
                 };
             }
 
-            // NOUVELLE FONCTIONNALITÉ : Recherche automatique avec fallback
             async performAutomaticSearch(track) {
                 console.log('[LyricsBear] Recherche automatique démarrée pour:', track.name);
                 
@@ -917,15 +1012,18 @@
                         console.log('[LyricsBear] Tentative source:', source);
                         this.updateSourceStatus(source, 'loading');
                         
+                        // TIMEOUT ADAPTÉ à chaque source
+                        const timeout = source === 'network-batch' ? 8000 : CONFIG.REQUEST_TIMEOUT;
+                        
                         const lyricsData = await Promise.race([
                             this.fetchLyricsFromSource(track, source),
                             new Promise((_, reject) => 
-                                setTimeout(() => reject(new Error('Timeout')), CONFIG.REQUEST_TIMEOUT)
+                                setTimeout(() => reject(new Error('Timeout')), timeout)
                             )
                         ]);
                         
                         if (lyricsData && lyricsData.lines && lyricsData.lines.length > 0) {
-                            console.log('[LyricsBear] Paroles trouvées via:', source);
+                            console.log('[LyricsBear] ✅ Paroles trouvées via:', source);
                             this.updateSourceStatus(source, 'success');
                             this.updateStatusInfo(`Paroles trouvées via ${source} - ${lyricsData.hasWordSync ? 'Sync mot par mot' : 'Sync ligne par ligne'}`);
                             
@@ -940,10 +1038,10 @@
                         console.warn('[LyricsBear] Erreur source', source, ':', error.message);
                         this.updateSourceStatus(source, 'error');
                         lastError = error;
+                        // CONTINUER vers la source suivante au lieu d'abandonner
                     }
                 }
                 
-                // Aucune source n'a fonctionné
                 this.updateStatusInfo('Aucune parole trouvée sur toutes les sources');
                 throw lastError || new Error('Toutes les sources ont échoué');
             }
@@ -1666,38 +1764,120 @@
             }
 
             async fetchFromNetworkBatch(track) {
-                console.log('[LyricsBear] Recherche dans données interceptées pour:', track.id);
+                console.log('[LyricsBear] 🔥 FORCE FETCH SPOTIFY WORD SYNC pour:', track.name);
                 
-                const possibleIds = [
-                    track.id,
-                    track.id?.replace(/^spotify:track:/, ''),
-                    track.uri?.replace(/^spotify:track:/, ''),
-                    track.name + '-' + (track.artists?.[0]?.name || '')
-                ];
-                
-                for (const id of possibleIds) {
-                    if (!id) continue;
-                    
-                    const cachedData = state.interceptedData.get(id);
-                    if (cachedData && (Date.now() - cachedData.timestamp < CONFIG.CACHE_DURATION)) {
-                        console.log('[LyricsBear] Données trouvées en cache pour ID:', id);
-                        return cachedData.data;
-                    }
-                    
-                    for (const [cachedId, cachedData] of state.interceptedData.entries()) {
-                        if (this.trackIdsMatch(id, cachedId)) {
-                            console.log('[LyricsBear] Données trouvées avec correspondance partielle:', cachedId);
-                            return cachedData.data;
-                        }
-                    }
+                const trackId = track.id?.replace(/^spotify:track:/, '') || track.id;
+                if (!trackId) {
+                    throw new Error('ID manquant');
                 }
                 
-                console.log('[LyricsBear] En attente interception pour:', track.name);
+                // ÉTAPE 1 : Vérifier cache
+                const cachedData = state.interceptedData.get(trackId);
+                if (cachedData && (Date.now() - cachedData.timestamp < CONFIG.CACHE_DURATION)) {
+                    console.log('[LyricsBear] ✅ Cache trouvé');
+                    return cachedData.data;
+                }
+                
+                // ÉTAPE 2 : FORCE FETCH avec CosmosAsync (API INTERNE SPOTIFY)
+                if (window.Spicetify?.CosmosAsync) {
+                    try {
+                        console.log('[LyricsBear] 💪 Force fetch CosmosAsync...');
+                        
+                        const response = await Spicetify.CosmosAsync.get(
+                            `https://spclient.wg.spotify.com/color-lyrics/v2/track/${trackId}`,
+                            {
+                                format: 'json',
+                                vocalRemoval: false,
+                                market: 'from_token'
+                            }
+                        );
+                        
+                        console.log('[LyricsBear] Réponse CosmosAsync:', response);
+                        
+                        if (response && response.lyrics) {
+                            console.log('[LyricsBear] ✅✅✅ WORD SYNC TROUVÉ via CosmosAsync !');
+                            const converted = this.convertBatchToLyrics(response.lyrics);
+                            
+                            // Mettre en cache
+                            state.interceptedData.set(trackId, {
+                                data: converted,
+                                timestamp: Date.now(),
+                                sourceUrl: 'cosmos-force-fetch',
+                                originalData: response.lyrics
+                            });
+                            
+                            return converted;
+                        } else {
+                            console.warn('[LyricsBear] Réponse CosmosAsync sans lyrics');
+                        }
+                    } catch (cosmosError) {
+                        console.error('[LyricsBear] ❌ CosmosAsync échoué:', cosmosError);
+                    }
+                } else {
+                    console.warn('[LyricsBear] ⚠️ Spicetify.CosmosAsync non disponible !');
+                }
+                
+                // ÉTAPE 3 : Fetch direct avec token (FALLBACK)
+                if (window.Spicetify?.Platform?.Session) {
+                    try {
+                        console.log('[LyricsBear] 💪 Force fetch avec token...');
+                        
+                        const accessToken = Spicetify.Platform.Session.accessToken;
+                        
+                        if (!accessToken) {
+                            throw new Error('Pas de token disponible');
+                        }
+                        
+                        const response = await fetch(
+                            `https://spclient.wg.spotify.com/color-lyrics/v2/track/${trackId}?format=json&vocalRemoval=false&market=from_token`,
+                            {
+                                method: 'GET',
+                                headers: {
+                                    'Authorization': `Bearer ${accessToken}`,
+                                    'App-Platform': 'WebPlayer',
+                                    'Accept': 'application/json',
+                                    'Spotify-App-Version': '1.2.0'
+                                }
+                            }
+                        );
+                        
+                        console.log('[LyricsBear] Fetch token status:', response.status);
+                        
+                        if (response.ok) {
+                            const data = await response.json();
+                            console.log('[LyricsBear] Fetch token data:', data);
+                            
+                            if (data && data.lyrics) {
+                                console.log('[LyricsBear] ✅✅✅ WORD SYNC TROUVÉ via token fetch !');
+                                const converted = this.convertBatchToLyrics(data.lyrics);
+                                
+                                // Mettre en cache
+                                state.interceptedData.set(trackId, {
+                                    data: converted,
+                                    timestamp: Date.now(),
+                                    sourceUrl: 'token-force-fetch',
+                                    originalData: data.lyrics
+                                });
+                                
+                                return converted;
+                            }
+                        } else {
+                            console.warn('[LyricsBear] Fetch token HTTP', response.status);
+                        }
+                    } catch (fetchError) {
+                        console.error('[LyricsBear] ❌ Fetch token échoué:', fetchError);
+                    }
+                } else {
+                    console.warn('[LyricsBear] ⚠️ Spicetify.Platform.Session non disponible !');
+                }
+                
+                // ÉTAPE 4 : Attendre l'interception passive (dernier recours)
+                console.log('[LyricsBear] 🕐 Fallback: attente interception passive (5s)...');
                 
                 return new Promise((resolve, reject) => {
                     const timeout = setTimeout(() => {
-                        reject(new Error('Timeout: aucune donnée interceptée'));
-                    }, CONFIG.REQUEST_TIMEOUT);
+                        reject(new Error('Timeout: aucune parole word sync disponible'));
+                    }, 5000);
                     
                     const checkInterval = setInterval(() => {
                         if (state.currentTrack?.id !== track.id) {
@@ -1707,18 +1887,14 @@
                             return;
                         }
                         
-                        for (const id of possibleIds) {
-                            if (!id) continue;
-                            
-                            const newData = state.interceptedData.get(id);
-                            if (newData && (Date.now() - newData.timestamp < 5000)) {
-                                clearTimeout(timeout);
-                                clearInterval(checkInterval);
-                                resolve(newData.data);
-                                return;
-                            }
+                        const newData = state.interceptedData.get(trackId);
+                        if (newData && (Date.now() - newData.timestamp < 5000)) {
+                            clearTimeout(timeout);
+                            clearInterval(checkInterval);
+                            resolve(newData.data);
+                            return;
                         }
-                    }, 300);
+                    }, 100);
                 });
             }
 
@@ -1730,33 +1906,92 @@
                     throw new Error('ID de piste manquant');
                 }
                 
-                const url = `${CONFIG.API_ENDPOINTS.BEAUTIFUL_LYRICS}${trackId}`;
-                
-                try {
-                    const response = await fetch(url, {
-                        headers: {
-                            'User-Agent': 'LyricsBear/166'
-                        },
-                        signal: AbortSignal.timeout(CONFIG.REQUEST_TIMEOUT)
-                    });
-
-                    if (!response.ok) {
-                        throw new Error(`HTTP ${response.status}`);
+                // ÉTAPE 1 : Vérifier si Beautiful Lyrics a déjà chargé les données
+                console.log('[LyricsBear] Vérification cache Beautiful Lyrics...');
+                for (const [cachedId, cachedData] of state.interceptedData.entries()) {
+                    if (this.trackIdsMatch(trackId, cachedId) && 
+                        cachedData.sourceUrl && 
+                        cachedData.sourceUrl.includes('beautiful-lyrics')) {
+                        console.log('[LyricsBear] ✅ Beautiful Lyrics trouvé en cache');
+                        return cachedData.data;
                     }
-                    
-                    const data = await response.json();
-                    const convertedData = this.convertBeautifulLyrics(data);
-                    
-                    if (!convertedData || !convertedData.lines || convertedData.lines.length === 0) {
-                        throw new Error('Aucune parole disponible');
-                    }
-                    
-                    return convertedData;
-                    
-                } catch (error) {
-                    console.error('[LyricsBear] Erreur Beautiful Lyrics:', error);
-                    throw error;
                 }
+                
+                // ÉTAPE 2 : Beautiful Lyrics n'est PAS installé ou ne fonctionne pas
+                // Essayer l'API directement SANS proxy (accepter l'échec CORS)
+                console.log('[LyricsBear] Tentative Beautiful Lyrics API directe...');
+                
+                return new Promise((resolve, reject) => {
+                    const timeout = setTimeout(() => {
+                        reject(new Error('Beautiful Lyrics non disponible (CORS ou non installé)'));
+                    }, 2000);
+                    
+                    // Vérifier si Beautiful Lyrics va charger dans les 2 prochaines secondes
+                    const checkInterval = setInterval(() => {
+                        for (const [cachedId, cachedData] of state.interceptedData.entries()) {
+                            if (this.trackIdsMatch(trackId, cachedId) && 
+                                cachedData.sourceUrl && 
+                                cachedData.sourceUrl.includes('beautiful-lyrics')) {
+                                clearTimeout(timeout);
+                                clearInterval(checkInterval);
+                                resolve(cachedData.data);
+                                return;
+                            }
+                        }
+                    }, 100);
+                });
+            }
+
+            // Nouvelle méthode helper pour le proxy en fallback
+            async fetchBeautifulLyricsWithProxy(trackId) {
+                const originalUrl = `${CONFIG.API_ENDPOINTS.BEAUTIFUL_LYRICS}${trackId}`;
+                
+                // Proxies CORS fiables et rapides (dans l'ordre de préférence)
+                const corsProxies = [
+                    { url: 'https://api.allorigins.win/raw?url=', name: 'AllOrigins' },
+                    { url: 'https://corsproxy.io/?', name: 'CorsProxy.io' },
+                    { url: 'https://api.codetabs.com/v1/proxy?quest=', name: 'CodeTabs' }
+                ];
+                
+                for (const proxy of corsProxies) {
+                    try {
+                        const proxyUrl = proxy.url + encodeURIComponent(originalUrl);
+                        console.log(`[LyricsBear] Tentative proxy ${proxy.name}:`, proxyUrl);
+                        
+                        const controller = new AbortController();
+                        const timeoutId = setTimeout(() => controller.abort(), 8000);
+                        
+                        const response = await fetch(proxyUrl, {
+                            method: 'GET',
+                            headers: {
+                                'Accept': 'application/json'
+                            },
+                            signal: controller.signal
+                        });
+                        
+                        clearTimeout(timeoutId);
+                        
+                        if (!response.ok) {
+                            throw new Error(`HTTP ${response.status}`);
+                        }
+                        
+                        const data = await response.json();
+                        const convertedData = this.convertBeautifulLyrics(data);
+                        
+                        if (!convertedData || !convertedData.lines || convertedData.lines.length === 0) {
+                            throw new Error('Aucune parole disponible');
+                        }
+                        
+                        console.log(`[LyricsBear] ✅ Succès avec proxy ${proxy.name}`);
+                        return convertedData;
+                        
+                    } catch (error) {
+                        console.warn(`[LyricsBear] Échec proxy ${proxy.name}:`, error.message);
+                        // Continuer avec le prochain proxy
+                    }
+                }
+                
+                throw new Error('Tous les proxies Beautiful Lyrics ont échoué');
             }
 
             async fetchFromLRCLib(track) {
