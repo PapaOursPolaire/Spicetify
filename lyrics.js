@@ -205,9 +205,31 @@
     if (!data || typeof data !== 'object') return null;
 
     // 1. Spicy-Lyrics v5 word-sync direct (Content[])
-    if (CONFIG.preferWordSync && Array.isArray(data.Content)) {
-      const ws = parseSpicyWordSync(data);
-      if (ws) return ws;
+    if (Array.isArray(data.Content)) {
+      if (CONFIG.preferWordSync) {
+        const ws = parseSpicyWordSync(data);
+        if (ws) return ws;
+      }
+      // Fallback LINE immédiat si WORD indisponible ou désactivé
+      const lines = data.Content
+        .filter(i => (i.Lead?.Syllables || i.lead?.Syllables || i.words || i.text))
+        .map(i => {
+          const lead = i.Lead || i.lead;
+          if (lead?.Syllables) {
+            return {
+              text     : lead.Syllables.map(s => s.Text || s.text || '').join('').trim(),
+              startTime: toMs(lead.StartTime || lead.startTime),
+              endTime  : toMs(lead.EndTime   || lead.endTime),
+            };
+          }
+          return {
+            text     : (i.words || i.text || '').trim(),
+            startTime: toMs(i.startTimeMs || i.startTime || 0),
+            endTime  : toMs(i.endTimeMs   || i.endTime   || 0),
+          };
+        })
+        .filter(l => l.text);
+      if (lines.length) return { syncType: 'LINE', provider: 'spicylyrics-line', lines };
     }
 
     // 2. Enveloppé dans queries[]
@@ -233,29 +255,6 @@
     if (data.result?.lines)       return parseLineSync(data.result.lines, 'unknown');
     if (data.data?.lines)         return parseLineSync(data.data.lines, 'unknown');
     if (data.result?.data?.lines) return parseLineSync(data.result.data.lines, 'spicylyrics');
-
-    // 6. Content[] présent mais pas Type Vocal → fallback LINE
-    if (Array.isArray(data.Content) && data.Content.length) {
-      const lines = data.Content
-        .filter(i => (i.Lead?.Syllables || i.lead?.Syllables || i.words || i.text))
-        .map(i => {
-          const lead = i.Lead || i.lead;
-          if (lead?.Syllables) {
-            return {
-              text     : lead.Syllables.map(s => s.Text || s.text || '').join('').trim(),
-              startTime: toMs(lead.StartTime || lead.startTime),
-              endTime  : toMs(lead.EndTime   || lead.endTime),
-            };
-          }
-          return {
-            text     : (i.words || i.text || '').trim(),
-            startTime: toMs(i.startTimeMs || i.startTime || 0),
-            endTime  : toMs(i.endTimeMs   || i.endTime   || 0),
-          };
-        })
-        .filter(l => l.text);
-      if (lines.length) return { syncType: 'LINE', provider: 'spicylyrics-fallback', lines };
-    }
 
     return null;
   }
@@ -313,7 +312,7 @@
   /* ═══════════════════════════════════════════════════════════
      TRAITEMENT PAYLOAD
   ═══════════════════════════════════════════════════════════ */
-  async function processPayload(raw) {
+  async function processPayload(raw, { force = false } = {}) {
     let data;
     if (typeof raw === 'string') {
       try { data = JSON.parse(raw); } catch { return; }
@@ -345,8 +344,18 @@
       await saveLyrics(ti, lyrics);
 
     } else {
-      // LINE/NONE → mettre en attente pour laisser une chance au WORD
+      // LINE/NONE
       if (state.savedTrackIds.has(id)) return;
+
+      // En mode force (bouton "Piste actuelle") : sauvegarder immédiatement sans attendre WORD
+      if (force) {
+        if (state.pending[id]) { clearTimeout(state.pending[id].timer); delete state.pending[id]; }
+        uiAddLog(`↓ ${lyrics.syncType} (force) — ${ti.trackName}`, 'info');
+        await saveLyrics(ti, lyrics);
+        return;
+      }
+
+      // Sinon → mettre en attente pour laisser une chance au WORD
       if (state.pending[id]) {
         // Déjà en attente : garder le meilleur (LINE > NONE)
         if (lyrics.syncType === 'LINE' && state.pending[id].bestLyrics?.syncType === 'NONE') {
@@ -585,7 +594,7 @@
           if (res.ok) {
             const data = await res.json();
             log('Paroles récupérées via API directe Spotify');
-            await processPayload(data);
+            await processPayload(data, { force: true });
             if (state.savedTrackIds.has(ti.trackId)) return;
           }
         }
@@ -596,7 +605,7 @@
     const payload = getSpicyLyricsPayload();
     if (payload) {
       log('Données SpicyLyrics disponibles localement');
-      await processPayload(payload);
+      await processPayload(payload, { force: true });
       if (state.savedTrackIds.has(ti.trackId)) return;
     }
 
