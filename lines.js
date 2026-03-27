@@ -85,7 +85,9 @@
     log.info('GET', url);
 
     try {
-      const res = await fetch(url, {
+      // Bypasser le hook fetch de lyrics.js via son origFetch stocké
+      const nativeFetch = window.SpotifyLyricsSaver?.state?.origFetch ?? window.fetch;
+      const res = await nativeFetch(url, {
         headers: { 'Authorization': `Bearer ${token}`, 'App-Platform': 'WebPlayer' },
       });
       log.info(`Réponse HTTP: ${res.status} ${res.statusText}`);
