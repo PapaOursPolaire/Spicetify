@@ -137,7 +137,10 @@
     if (!syllables.length) return null;
 
     const words    = syllablesToWords(syllables);
-    const lineText = syllables.map(s => s.Text || s.text || '').join('').trim();
+    // BUG FIX : join('') produisait "Jet'aime,jetehais" — les syllabes brutes
+    // sont collées sans espace. On reconstruit depuis words[] qui ont déjà été
+    // fusionnées correctement par syllablesToWords() (IsPartOfWord respecté).
+    const lineText = words.map(w => w.text).join(' ').trim();
     if (!lineText) return null;
 
     return {
@@ -402,20 +405,6 @@
       rawLyrics: rawData || null,
     };
 
-    // ── Garde-fou anti double-save concurrent ───────────────────────────────
-    // processPayload peut être appelé plusieurs fois de suite sans await (polling
-    // 600ms, IDB write hook, fetch hook…). Si deux appels concurrents arrivent avant
-    // que savedScore soit positionné, ils passeraient tous les deux le check
-    // prevScore >= score et déclencheraient deux saveLyrics simultanés.
-    // On marque le score AVANT le download pour court-circuiter le second appel.
-    if (!state.savedScore) state.savedScore = {};
-    const prevSavedScore = state.savedScore[trackInfo.trackId] ?? 0;
-    if (prevSavedScore >= score) {
-      log(`⚠ saveLyrics annulé — score déjà enregistré (${prevSavedScore} ≥ ${score}) pour ${trackInfo.trackName}`);
-      return;
-    }
-    state.savedScore[trackInfo.trackId] = score;  // verrouille avant I/O asynchrone
-
     const filename = `${sanitize(trackInfo.artistName)} - ${sanitize(trackInfo.trackName)}.json`;
     const blob     = new Blob([JSON.stringify(output, null, 2)], { type: 'application/json' });
     const url      = URL.createObjectURL(blob);
@@ -423,15 +412,16 @@
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    // 300ms était trop court : dans Spotify/Electron le download peut démarrer
-    // plus tard (tab en arrière-plan, Electron occupé, plusieurs downloads en file).
-    // Si l'URL est révoquée avant que le download démarre, le fichier n'est pas créé
-    // mais l'état interne dit "sauvegardé" → blocage silencieux définitif.
-    // 60s est largement suffisant pour tout scénario réel.
+    // 300ms trop court : dans Spotify/Electron le download peut démarrer après
+    // (tab en arrière-plan, Electron occupé). Si l'URL est révoquée avant que le
+    // download démarre, le fichier n'est pas créé mais savedScore dit "sauvegardé".
     setTimeout(() => URL.revokeObjectURL(url), 60_000);
 
     state.savedTrackIds.add(trackInfo.trackId);
-    const isUpgrade = prevSavedScore > 0;
+    // Enregistrer le score de qualité pour permettre le remplacement par une meilleure version
+    if (!state.savedScore) state.savedScore = {};
+    const isUpgrade = (state.savedScore[trackInfo.trackId] ?? 0) > 0;
+    state.savedScore[trackInfo.trackId] = score;
     if (!isUpgrade) state.totalSaved++;
     state.retryCount = 0;
 
@@ -1040,9 +1030,6 @@
 
     state.savedTrackIds.delete(ti.trackId);
     delete state.pending[ti.trackId];
-    // ── Fix : effacer savedScore sinon processPayload voit prevScore >= score
-    //         et bloque silencieusement même après un forçage manuel.
-    if (state.savedScore) delete state.savedScore[ti.trackId];
     state.retryCount = 0;
     uiAddLog(`↻ Force: ${ti.artistName} — ${ti.trackName}`, 'info');
     uiSetStatus('active');
@@ -1128,13 +1115,7 @@
     uiUpdateStats();
     if (state.queueMode) {
       const ti = getCurrentTrackInfo();
-      if (ti) {
-        state.savedTrackIds.delete(ti.trackId);
-        // Même fix que forceCurrentTrack : effacer savedScore pour que
-        // processPayload accepte de re-sauvegarder la piste en cours.
-        if (state.savedScore) delete state.savedScore[ti.trackId];
-        Spicetify?.Player?.seek?.(0);
-      }
+      if (ti) { state.savedTrackIds.delete(ti.trackId); Spicetify?.Player?.seek?.(0); }
     }
   }
 
@@ -1347,6 +1328,17 @@
       if (!ti || ti.trackId === state.currentTrackId) return;
       state.currentTrackId = ti.trackId;
       state.retryCount     = 0;
+
+      // ── Fix : débloquer le polling pour la piste entrante ─────────────
+      // savedTrackIds s'accumule sur toute la session et n'est jamais nettoyé
+      // pour la piste en cours. Quand une piste repasse (shuffle, repeat,
+      // retour dans la file), savedTrackIds.has(id) = true bloquait le polling
+      // définitivement. Or SpicyLyrics sert alors depuis son IDB cache (pas de
+      // requête réseau) → le hook fetch ne se déclenche pas non plus → blocage total.
+      // En supprimant la piste entrante ici, le polling peut se ré-exécuter.
+      // savedScore est conservé : processPayload bloquera les re-téléchargements
+      // inutiles si le score est déjà optimal (prevScore >= score).
+      state.savedTrackIds.delete(ti.trackId);
 
       // ── Sauvegarde d'urgence des paroles en attente ──────────────────
       // Avant mon fix, les timers pendants étaient simplement annulés (clearTimeout)
