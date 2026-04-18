@@ -37,6 +37,8 @@
     pollingTimer   : null,
     pending        : {},   // { [trackId]: { timer, bestLyrics } }
     trackSeenAt    : {},
+    idbCacheGhosted    : false,  // quand true : IDB reads retournent vide → force re-fetch
+    _idbReadFromOurCode: false,  // flag pour exclure nos propres lectures de readFromIDB
   };
 
   /* ═══════════════════════════════════════════════════════════
@@ -345,8 +347,12 @@
         .map(i => {
           const lead = i.Lead || i.lead;
           if (lead?.Syllables) {
+            // BUG FIX (fallback LINE) : même correction que parseSection —
+            // syllablesToWords() respecte IsPartOfWord pour reconstruire les mots.
+            const fallbackWords = syllablesToWords(lead.Syllables);
+            const fallbackText  = fallbackWords.map(w => w.text).join(' ').trim();
             return {
-              text     : lead.Syllables.map(s => s.Text || s.text || '').join('').trim(),
+              text     : fallbackText,
               startTime: toMs(lead.StartTime || lead.startTime),
               endTime  : toMs(lead.EndTime   || lead.endTime),
             };
@@ -765,6 +771,8 @@
    * Retourne le premier objet valide trouvé, ou null.
    */
   async function readFromIDB(trackId) {
+    state._idbReadFromOurCode = true;
+    try {
     for (const dbName of IDB_DB_NAMES) {
       let db = null;
       try {
@@ -836,6 +844,7 @@
       }
     }
     return null;
+  } finally { state._idbReadFromOurCode = false; }
   }
 
   /**
@@ -903,6 +912,76 @@
     };
 
     log('✓ IDB writes hookés (put/add)');
+  }
+
+  /**
+   * Hook sur IDBObjectStore.prototype.get / getAll / openCursor
+   * Quand state.idbCacheGhosted === true, retourne un résultat vide à SpicyLyrics
+   * → SpicyLyrics croit que son cache est vide → fait un vrai fetch réseau
+   * → le hook fetch se déclenche et on récupère les paroles.
+   *
+   * On ne ghost QUE pendant la fenêtre activée (clearIDB), puis on restaure.
+   * Les appels provenant de notre propre readFromIDB() sont exclus via un flag.
+   */
+  function hookIDBReads() {
+    const origGet       = IDBObjectStore.prototype.get;
+    const origGetAll    = IDBObjectStore.prototype.getAll;
+    const origOpenCursor = IDBObjectStore.prototype.openCursor;
+
+    function makeEmptyRequest(successValue) {
+      // Crée un faux IDBRequest qui se résout immédiatement avec successValue
+      const fakeReq = Object.create(IDBRequest.prototype);
+      fakeReq.readyState = 'done';
+      fakeReq.result     = successValue;
+      fakeReq.error      = null;
+      // Les listeners sont appelés via microtask pour simuler l'asynchronisme IDB
+      const listeners = { success: [], error: [] };
+      fakeReq.addEventListener = (type, fn) => { (listeners[type] || []).push(fn); };
+      fakeReq.onsuccess = null;
+      // On définit la propriété onsuccess comme un setter pour que l'appelant puisse l'assigner
+      Object.defineProperty(fakeReq, 'onsuccess', {
+        configurable: true,
+        set(fn) { if (fn) listeners.success.push(fn); },
+        get()   { return listeners.success[listeners.success.length - 1] || null; },
+      });
+      Object.defineProperty(fakeReq, 'onerror', {
+        configurable: true,
+        set() {},
+        get() { return null; },
+      });
+      Promise.resolve().then(() => {
+        const evt = new Event('success');
+        Object.defineProperty(evt, 'target', { value: fakeReq });
+        listeners.success.forEach(fn => { try { fn(evt); } catch {} });
+      });
+      return fakeReq;
+    }
+
+    IDBObjectStore.prototype.get = function (...args) {
+      if (state.idbCacheGhosted && !state._idbReadFromOurCode) {
+        log('IDB get ghosté (cache neutralisé pour re-fetch)');
+        return makeEmptyRequest(undefined);
+      }
+      return origGet.apply(this, args);
+    };
+
+    IDBObjectStore.prototype.getAll = function (...args) {
+      if (state.idbCacheGhosted && !state._idbReadFromOurCode) {
+        log('IDB getAll ghosté (cache neutralisé pour re-fetch)');
+        return makeEmptyRequest([]);
+      }
+      return origGetAll.apply(this, args);
+    };
+
+    IDBObjectStore.prototype.openCursor = function (...args) {
+      if (state.idbCacheGhosted && !state._idbReadFromOurCode) {
+        log('IDB openCursor ghosté');
+        return makeEmptyRequest(null);
+      }
+      return origOpenCursor.apply(this, args);
+    };
+
+    log('✓ IDB reads hookés (get/getAll/openCursor)');
   }
 
   function hookSpicyLyricsObject() {
@@ -1389,7 +1468,48 @@
       clearSaved : () => {
         state.savedTrackIds.clear();
         state.savedScore = {};
-        uiAddLog('Cache vidé', 'info');
+        uiAddLog('Cache mémoire vidé', 'info');
+      },
+
+      // Neutralise le cache IDB de SpicyLyrics SANS le supprimer physiquement.
+      // Pendant ghostDurationMs, tous les IDB reads (get/getAll/openCursor) retournent
+      // vide → SpicyLyrics croit que son cache est absent → fait un vrai fetch réseau
+      // → le hook fetch intercepte les paroles.
+      // Appel : await SpotifyLyricsSaver.clearIDB()   (optionnel : clearIDB(10000) pour 10s)
+      clearIDB   : async (ghostDurationMs = 8000) => {
+        if (state.idbCacheGhosted) {
+          uiAddLog('ℹ Ghost IDB déjà actif — reset du timer', 'info');
+          clearTimeout(state._ghostTimer);
+        } else {
+          state.idbCacheGhosted = true;
+          state.savedTrackIds.clear();
+          state.savedScore = {};
+          const msg = `IDB cache ghosté ${ghostDurationMs / 1000}s — SpicyLyrics va re-fetcher`;
+          log(msg);
+          uiAddLog(msg, 'warn');
+          Spicetify?.showNotification?.('[LyricsSaver] Cache ghosté — re-fetch en cours…');
+        }
+
+        // Auto-désactivation après ghostDurationMs
+        state._ghostTimer = setTimeout(() => {
+          state.idbCacheGhosted = false;
+          log('Ghost IDB désactivé (timeout)');
+          uiAddLog('Ghost IDB désactivé', 'info');
+        }, ghostDurationMs);
+
+        // Seek à 0 pour déclencher le rechargement de SpicyLyrics
+        await new Promise(r => setTimeout(r, 200));
+        Spicetify?.Player?.seek?.(0);
+        await new Promise(r => setTimeout(r, 500));
+        // Tentative forceNow en parallèle
+        forceCurrentTrack().catch(() => {});
+      },
+
+      // Désactive manuellement le ghost IDB avant le timeout
+      disableGhost: () => {
+        state.idbCacheGhosted = false;
+        clearTimeout(state._ghostTimer);
+        uiAddLog('Ghost IDB désactivé manuellement', 'info');
       },
 
       // Dump l'objet global SpicyLyrics (window.SpicyLyrics)
@@ -1471,6 +1591,7 @@
   function activateAll() {
     buildUI();
     hookIDBWrites();          // ← EN PREMIER : patche put/add avant que SpicyLyrics écrive
+    hookIDBReads();           // ← patche get/getAll/openCursor pour le ghost cache
     hookSpicyLyricsObject();  // ← avant hookFetch pour capter l'objet global en premier
     hookFetch();
     hookXHR();
