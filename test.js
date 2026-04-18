@@ -152,9 +152,12 @@
    * Parse le format Spicy-Lyrics v5 word-sync en préservant TOUTE la richesse du JSON :
    *
    * Chaque item dans Content[] peut avoir :
-   *   - Type        : "Vocal" | "Background" (casse variable)
-   *   - Lead        : section chanteur principal
-   *   - Background  : section backing vocal (présente uniquement si elle existe)
+   *   - Type           : "Vocal" | "Background" (casse variable)
+   *   - Lead           : section chanteur principal (objet unique)
+   *   - Background     : backing vocals — ATTENTION : l'API retourne un TABLEAU d'objets
+   *                      (ex: [{ Syllables[], StartTime, EndTime }]), pas un objet unique.
+   *                      On normalise en un tableau `backgrounds[]` et on expose aussi
+   *                      `background` (premier élément) pour compatibilité descendante.
    *   - OppositeAligned : booléen — vrai pour second chanteur / duet
    *
    * La structure de sortie par ligne :
@@ -162,8 +165,9 @@
    *   type           : "Vocal" | "Background",
    *   oppositeAligned: boolean,
    *   lead           : { text, startTime, endTime, words[] } | null,
-   *   background     : { text, startTime, endTime, words[] } | null,
-   *   // champs plats pour compatibilité (dérivés du lead ou background selon type)
+   *   background     : { text, startTime, endTime, words[] } | null,  // 1er bg (compat)
+   *   backgrounds    : Array<{ text, startTime, endTime, words[] }>,   // TOUS les bgs
+   *   // champs plats pour compatibilité (dérivés du lead ou du 1er background)
    *   text           : string,
    *   startTime      : number,
    *   endTime        : number,
@@ -183,20 +187,29 @@
         // OppositeAligned : propriété directe sur l'item
         const oppositeAligned = item.OppositeAligned ?? item.oppositeAligned ?? false;
 
-        const lead       = parseSection(item.Lead       || item.lead);
-        const background = parseSection(item.Background || item.background);
+        const lead = parseSection(item.Lead || item.lead);
+
+        // ── Background : l'API retourne un tableau, pas un objet unique ──
+        // Formats possibles :
+        //   { Background: [{ Syllables:[], StartTime, EndTime }] }  ← api.spicylyrics.org
+        //   { Background:  { Syllables:[], StartTime, EndTime }  }  ← ancien format / IDB
+        const bgRaw    = item.Background || item.background;
+        const bgArray  = Array.isArray(bgRaw) ? bgRaw : (bgRaw ? [bgRaw] : []);
+        const backgrounds = bgArray.map(b => parseSection(b)).filter(Boolean);
+        const background  = backgrounds[0] || null; // compat descendante
 
         // Il faut au moins une section non-vide pour valider la ligne
         if (!lead && !background) continue;
 
-        // Champs plats : on privilégie Lead, sinon Background
+        // Champs plats : on privilégie Lead, sinon le premier Background
         const primary = lead || background;
 
         lines.push({
           type,
           oppositeAligned,
           lead,
-          background,
+          background,   // premier background (compatibilité descendante)
+          backgrounds,  // TOUS les backgrounds (nouveau — préserve fidèlement l'API)
           // Champs plats (compatibilité descendante avec le reste du code)
           text     : primary.text,
           startTime: primary.startTime,
@@ -210,15 +223,16 @@
       const totalWords = lines.reduce((n, l) => n + (l.words?.length || 0), 0);
       if (totalWords === 0) return null;
 
-      const hasBackground     = lines.some(l => l.background !== null);
+      const hasBackground     = lines.some(l => l.backgrounds?.length > 0);
       const hasOpposite       = lines.some(l => l.oppositeAligned);
       const hasBackgroundType = lines.some(l => l.type === 'Background');
+      const totalBgSections   = lines.reduce((n, l) => n + (l.backgrounds?.length || 0), 0);
 
       log(
         `✓ WORD parsé : ${lines.length} lignes, ${totalWords} mots` +
-        (hasBackground     ? ' [+Background vocals]' : '') +
-        (hasOpposite       ? ' [+OppositeAligned]'   : '') +
-        (hasBackgroundType ? ' [+type:Background]'   : '')
+        (hasBackground     ? ` [+Background vocals ×${totalBgSections}]` : '') +
+        (hasOpposite       ? ' [+OppositeAligned]'                        : '') +
+        (hasBackgroundType ? ' [+type:Background]'                        : '')
       );
 
       return {
@@ -355,7 +369,8 @@
   async function saveLyrics(trackInfo, lyricsData, score = 0, rawData = null) {
     // Statistiques enrichies
     const wordCount            = lyricsData.lines.reduce((s, l) => s + (l.words?.length || 0), 0);
-    const backgroundLineCount  = lyricsData.lines.filter(l => l.background !== null && l.background !== undefined).length;
+    const backgroundLineCount  = lyricsData.lines.filter(l => l.backgrounds?.length > 0).length;
+    const backgroundSectCount  = lyricsData.lines.reduce((n, l) => n + (l.backgrounds?.length || 0), 0);
     const backgroundTypeCount  = lyricsData.lines.filter(l => l.type === 'Background').length;
     const oppositeAlignedCount = lyricsData.lines.filter(l => l.oppositeAligned).length;
 
@@ -373,6 +388,7 @@
         lineCount           : lyricsData.lines.length,
         wordCount,
         backgroundLineCount,
+        backgroundSectCount,
         backgroundTypeCount,
         oppositeAlignedCount,
         songWriters         : lyricsData.songWriters || [],
@@ -407,10 +423,10 @@
     if (st) st.textContent = lyricsData.syncType;
 
     const extras = [
-      backgroundLineCount  ? `bg:${backgroundLineCount}`   : null,
-      backgroundTypeCount  ? `bgT:${backgroundTypeCount}`  : null,
-      oppositeAlignedCount ? `opp:${oppositeAlignedCount}` : null,
-      score                ? `q:${score}`                  : null,
+      backgroundLineCount  ? `bg:${backgroundLineCount}(×${backgroundSectCount})`  : null,
+      backgroundTypeCount  ? `bgT:${backgroundTypeCount}`                           : null,
+      oppositeAlignedCount ? `opp:${oppositeAlignedCount}`                          : null,
+      score                ? `q:${score}`                                            : null,
     ].filter(Boolean).join(' ');
 
     const upgradeTag = isUpgrade ? ' [UPGRADE]' : '';
@@ -444,7 +460,7 @@
 
     // WORD — on évalue la richesse des données
     const lines = lyrics.lines || [];
-    const hasBackground     = lines.some(l => l.background !== null && l.background !== undefined);
+    const hasBackground     = lines.some(l => l.backgrounds?.length > 0);
     const hasOpposite       = lines.some(l => l.oppositeAligned === true);
     const hasBackgroundType = lines.some(l => l.type === 'Background');
     const hasWords          = lines.some(l => l.words?.length > 0);
