@@ -152,12 +152,9 @@
    * Parse le format Spicy-Lyrics v5 word-sync en préservant TOUTE la richesse du JSON :
    *
    * Chaque item dans Content[] peut avoir :
-   *   - Type           : "Vocal" | "Background" (casse variable)
-   *   - Lead           : section chanteur principal (objet unique)
-   *   - Background     : backing vocals — ATTENTION : l'API retourne un TABLEAU d'objets
-   *                      (ex: [{ Syllables[], StartTime, EndTime }]), pas un objet unique.
-   *                      On normalise en un tableau `backgrounds[]` et on expose aussi
-   *                      `background` (premier élément) pour compatibilité descendante.
+   *   - Type        : "Vocal" | "Background" (casse variable)
+   *   - Lead        : section chanteur principal
+   *   - Background  : section backing vocal (présente uniquement si elle existe)
    *   - OppositeAligned : booléen — vrai pour second chanteur / duet
    *
    * La structure de sortie par ligne :
@@ -165,9 +162,8 @@
    *   type           : "Vocal" | "Background",
    *   oppositeAligned: boolean,
    *   lead           : { text, startTime, endTime, words[] } | null,
-   *   background     : { text, startTime, endTime, words[] } | null,  // 1er bg (compat)
-   *   backgrounds    : Array<{ text, startTime, endTime, words[] }>,   // TOUS les bgs
-   *   // champs plats pour compatibilité (dérivés du lead ou du 1er background)
+   *   background     : { text, startTime, endTime, words[] } | null,
+   *   // champs plats pour compatibilité (dérivés du lead ou background selon type)
    *   text           : string,
    *   startTime      : number,
    *   endTime        : number,
@@ -187,29 +183,20 @@
         // OppositeAligned : propriété directe sur l'item
         const oppositeAligned = item.OppositeAligned ?? item.oppositeAligned ?? false;
 
-        const lead = parseSection(item.Lead || item.lead);
-
-        // ── Background : l'API retourne un tableau, pas un objet unique ──
-        // Formats possibles :
-        //   { Background: [{ Syllables:[], StartTime, EndTime }] }  ← api.spicylyrics.org
-        //   { Background:  { Syllables:[], StartTime, EndTime }  }  ← ancien format / IDB
-        const bgRaw    = item.Background || item.background;
-        const bgArray  = Array.isArray(bgRaw) ? bgRaw : (bgRaw ? [bgRaw] : []);
-        const backgrounds = bgArray.map(b => parseSection(b)).filter(Boolean);
-        const background  = backgrounds[0] || null; // compat descendante
+        const lead       = parseSection(item.Lead       || item.lead);
+        const background = parseSection(item.Background || item.background);
 
         // Il faut au moins une section non-vide pour valider la ligne
         if (!lead && !background) continue;
 
-        // Champs plats : on privilégie Lead, sinon le premier Background
+        // Champs plats : on privilégie Lead, sinon Background
         const primary = lead || background;
 
         lines.push({
           type,
           oppositeAligned,
           lead,
-          background,   // premier background (compatibilité descendante)
-          backgrounds,  // TOUS les backgrounds (nouveau — préserve fidèlement l'API)
+          background,
           // Champs plats (compatibilité descendante avec le reste du code)
           text     : primary.text,
           startTime: primary.startTime,
@@ -223,16 +210,15 @@
       const totalWords = lines.reduce((n, l) => n + (l.words?.length || 0), 0);
       if (totalWords === 0) return null;
 
-      const hasBackground     = lines.some(l => l.backgrounds?.length > 0);
+      const hasBackground     = lines.some(l => l.background !== null);
       const hasOpposite       = lines.some(l => l.oppositeAligned);
       const hasBackgroundType = lines.some(l => l.type === 'Background');
-      const totalBgSections   = lines.reduce((n, l) => n + (l.backgrounds?.length || 0), 0);
 
       log(
         `✓ WORD parsé : ${lines.length} lignes, ${totalWords} mots` +
-        (hasBackground     ? ` [+Background vocals ×${totalBgSections}]` : '') +
-        (hasOpposite       ? ' [+OppositeAligned]'                        : '') +
-        (hasBackgroundType ? ' [+type:Background]'                        : '')
+        (hasBackground     ? ' [+Background vocals]' : '') +
+        (hasOpposite       ? ' [+OppositeAligned]'   : '') +
+        (hasBackgroundType ? ' [+type:Background]'   : '')
       );
 
       return {
@@ -369,8 +355,7 @@
   async function saveLyrics(trackInfo, lyricsData, score = 0, rawData = null) {
     // Statistiques enrichies
     const wordCount            = lyricsData.lines.reduce((s, l) => s + (l.words?.length || 0), 0);
-    const backgroundLineCount  = lyricsData.lines.filter(l => l.backgrounds?.length > 0).length;
-    const backgroundSectCount  = lyricsData.lines.reduce((n, l) => n + (l.backgrounds?.length || 0), 0);
+    const backgroundLineCount  = lyricsData.lines.filter(l => l.background !== null && l.background !== undefined).length;
     const backgroundTypeCount  = lyricsData.lines.filter(l => l.type === 'Background').length;
     const oppositeAlignedCount = lyricsData.lines.filter(l => l.oppositeAligned).length;
 
@@ -388,7 +373,6 @@
         lineCount           : lyricsData.lines.length,
         wordCount,
         backgroundLineCount,
-        backgroundSectCount,
         backgroundTypeCount,
         oppositeAlignedCount,
         songWriters         : lyricsData.songWriters || [],
@@ -423,10 +407,10 @@
     if (st) st.textContent = lyricsData.syncType;
 
     const extras = [
-      backgroundLineCount  ? `bg:${backgroundLineCount}(×${backgroundSectCount})`  : null,
-      backgroundTypeCount  ? `bgT:${backgroundTypeCount}`                           : null,
-      oppositeAlignedCount ? `opp:${oppositeAlignedCount}`                          : null,
-      score                ? `q:${score}`                                            : null,
+      backgroundLineCount  ? `bg:${backgroundLineCount}`   : null,
+      backgroundTypeCount  ? `bgT:${backgroundTypeCount}`  : null,
+      oppositeAlignedCount ? `opp:${oppositeAlignedCount}` : null,
+      score                ? `q:${score}`                  : null,
     ].filter(Boolean).join(' ');
 
     const upgradeTag = isUpgrade ? ' [UPGRADE]' : '';
@@ -460,7 +444,7 @@
 
     // WORD — on évalue la richesse des données
     const lines = lyrics.lines || [];
-    const hasBackground     = lines.some(l => l.backgrounds?.length > 0);
+    const hasBackground     = lines.some(l => l.background !== null && l.background !== undefined);
     const hasOpposite       = lines.some(l => l.oppositeAligned === true);
     const hasBackgroundType = lines.some(l => l.type === 'Background');
     const hasWords          = lines.some(l => l.words?.length > 0);
@@ -521,16 +505,7 @@
   /* ═══════════════════════════════════════════════════════════
      TRAITEMENT PAYLOAD
   ═══════════════════════════════════════════════════════════ */
-  /**
-   * @param {string|object} raw        - Corps de la réponse (string JSON ou objet déjà parsé)
-   * @param {string|null}   expectedTrackId
-   *   ID de la piste au moment de l'interception (fetch/XHR/poll).
-   *   Fourni par les hooks pour détecter les payloads devenus obsolètes :
-   *   si la piste a changé entre l'interception et la résolution du promise,
-   *   les paroles seraient attribuées à la mauvaise piste → rejet.
-   *   null = pas de vérification (IDB synchrone, CustomEvent…).
-   */
-  async function processPayload(raw, expectedTrackId = null) {
+  async function processPayload(raw) {
     let data;
     if (typeof raw === 'string') {
       try { data = JSON.parse(raw); } catch { return; }
@@ -542,16 +517,6 @@
 
     const ti = getCurrentTrackInfo();
     if (!ti?.trackId) return;
-
-    // ── Garde-fou anti-attribution croisée ──────────────────────────
-    // Si expectedTrackId est fourni et diffère de la piste en cours,
-    // c'est que le payload (fetch async) appartient à une piste passée.
-    // On le rejette pour éviter de sauvegarder A sous l'ID de B,
-    // ce qui bloquerait ensuite la vraie sauvegarde de B (prevScore ≥ score).
-    if (expectedTrackId && expectedTrackId !== ti.trackId) {
-      log(`⚠ Payload obsolète rejeté — piste changée (${expectedTrackId} → ${ti.trackId})`);
-      return;
-    }
 
     uiSetStatus('parsing');
     const lyrics = autoDetect(data);
@@ -634,7 +599,7 @@
       await saveLyrics(ti, best, bestScore, bestRaw);
     }, CONFIG.spicyWaitMs);
 
-    state.pending[id] = { timer, bestLyrics: lyrics, rawData, trackInfo: ti };
+    state.pending[id] = { timer, bestLyrics: lyrics, rawData };
   }
 
   /* ═══════════════════════════════════════════════════════════
@@ -666,13 +631,7 @@
       const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
       if (looksLikeLyrics(url)) {
         log('fetch intercepté:', url);
-        // Capturer l'ID de piste MAINTENANT (réponse en cours de streaming).
-        // Le .text() est asynchrone : si la piste change avant sa résolution,
-        // processPayload recevrait expectedTrackId ≠ currentTrackId → rejet.
-        const capturedTrackId = getCurrentTrackInfo()?.trackId || null;
-        res.clone().text()
-          .then(text => processPayload(text, capturedTrackId))
-          .catch(() => {});
+        res.clone().text().then(processPayload).catch(() => {});
       }
       return res;
     };
@@ -694,10 +653,8 @@
     XMLHttpRequest.prototype.send = function (...args) {
       if (looksLikeLyrics(this._lsUrl)) {
         log('XHR intercepté:', this._lsUrl);
-        // Même logique que fetch : capturer l'ID avant l'asynchronisme.
-        const capturedTrackId = getCurrentTrackInfo()?.trackId || null;
         this.addEventListener('load', function () {
-          try { processPayload(this.responseText, capturedTrackId); } catch {}
+          try { processPayload(this.responseText); } catch {}
         });
       }
       return origSend.apply(this, args);
@@ -940,25 +897,22 @@
       if (!ti?.trackId) return;
       if (CONFIG.deduplicateByTrackId && state.savedTrackIds.has(ti.trackId)) return;
 
-      // Capturer l'ID avant tout await : la piste peut changer pendant un await IDB.
-      const capturedTrackId = ti.trackId;
-
-      if (state.queueMode && !state.pending[capturedTrackId]) {
-        const trackSeen = state.trackSeenAt[capturedTrackId];
+      if (state.queueMode && !state.pending[ti.trackId]) {
+        const trackSeen = state.trackSeenAt[ti.trackId];
         if (trackSeen && Date.now() - trackSeen > CONFIG.spicyWaitMs * 2) {
           uiAddLog(`⏭ Aucune parole disponible après ${CONFIG.spicyWaitMs * 2 / 1000}s — skip (${ti.trackName})`, 'warn');
-          state.savedTrackIds.add(capturedTrackId);
+          state.savedTrackIds.add(ti.trackId);
           setTimeout(() => Spicetify?.Player?.next?.(), 500);
           return;
         }
-        if (!trackSeen) state.trackSeenAt[capturedTrackId] = Date.now();
+        if (!trackSeen) state.trackSeenAt[ti.trackId] = Date.now();
       }
 
       // ── SOURCE 1 : IndexedDB (données enrichies SpicyLyrics) ──
       const idbData = await pollIDB();
       if (idbData) {
         log('Données via IndexedDB SpicyLyrics');
-        processPayload(idbData, capturedTrackId);
+        processPayload(idbData);
         return;
       }
 
@@ -966,7 +920,7 @@
       const payload = getSpicyLyricsPayload();
       if (payload) {
         log('Données via window.SpicyLyrics polling');
-        processPayload(payload, capturedTrackId);
+        processPayload(payload);
         return;
       }
 
@@ -977,7 +931,7 @@
           const raw = el.getAttribute('data-spicy-lyrics')
                    || el.getAttribute('data-lyrics-content')
                    || el.textContent;
-          if (raw) processPayload(JSON.parse(raw), capturedTrackId);
+          if (raw) processPayload(JSON.parse(raw));
         } catch {}
       }
     }, CONFIG.pollingInterval);
@@ -1323,26 +1277,12 @@
       state.currentTrackId = ti.trackId;
       state.retryCount     = 0;
 
-      // ── Sauvegarde d'urgence des paroles en attente ──────────────────
-      // Avant mon fix, les timers pendants étaient simplement annulés (clearTimeout)
-      // → les paroles des chansons avec score < 100 étaient définitivement perdues.
-      // Maintenant on sauvegarde immédiatement avant de passer à la piste suivante.
       for (const id of Object.keys(state.pending)) {
         if (id !== ti.trackId) {
-          const { timer, bestLyrics, rawData, trackInfo } = state.pending[id];
-          clearTimeout(timer);
+          clearTimeout(state.pending[id].timer);
           delete state.pending[id];
-          if (bestLyrics && trackInfo) {
-            const sc = qualityScore(bestLyrics);
-            if ((state.savedScore?.[id] ?? 0) < sc) {
-              log(`♪ songchange → sauvegarde urgente : ${trackInfo.trackName} (${qualityLabel(sc)})`);
-              // Fire-and-forget — on ne peut pas await ici (handler synchrone)
-              saveLyrics(trackInfo, bestLyrics, sc, rawData).catch(() => {});
-            }
-          }
         }
       }
-
       delete state.trackSeenAt[ti.trackId];
       // Ne pas effacer savedScore pour la piste en cours (permet upgrade si elle revient)
       // Mais effacer les anciennes pistes pour libérer la mémoire
