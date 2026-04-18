@@ -345,8 +345,12 @@
         .map(i => {
           const lead = i.Lead || i.lead;
           if (lead?.Syllables) {
+            // BUG FIX (fallback LINE) : même correction que parseSection —
+            // syllablesToWords() respecte IsPartOfWord pour reconstruire les mots.
+            const fallbackWords = syllablesToWords(lead.Syllables);
+            const fallbackText  = fallbackWords.map(w => w.text).join(' ').trim();
             return {
-              text     : lead.Syllables.map(s => s.Text || s.text || '').join('').trim(),
+              text     : fallbackText,
               startTime: toMs(lead.StartTime || lead.startTime),
               endTime  : toMs(lead.EndTime   || lead.endTime),
             };
@@ -1389,7 +1393,42 @@
       clearSaved : () => {
         state.savedTrackIds.clear();
         state.savedScore = {};
-        uiAddLog('Cache vidé', 'info');
+        uiAddLog('Cache mémoire vidé', 'info');
+      },
+
+      // Supprime TOUTES les entrées des IDB SpicyLyrics connues (force re-fetch réseau).
+      // Appel : await SpotifyLyricsSaver.clearIDB()
+      clearIDB   : async () => {
+        let deleted = 0;
+        let dbNames = [...IDB_DB_NAMES];
+        try {
+          const all = await indexedDB.databases();
+          dbNames = [...new Set([...all.map(d => d.name).filter(Boolean), ...IDB_DB_NAMES])];
+        } catch {}
+        for (const dbName of dbNames) {
+          const db = await openIDBReadOnly(dbName);
+          if (!db) continue;
+          for (const storeName of Array.from(db.objectStoreNames)) {
+            await new Promise(res => {
+              try {
+                const tx    = db.transaction(storeName, 'readwrite');
+                const store = tx.objectStore(storeName);
+                const req   = store.clear();
+                req.onsuccess = () => { deleted++; res(); };
+                req.onerror   = ()  => res();
+              } catch { res(); }
+            });
+          }
+          db.close();
+        }
+        state.savedTrackIds.clear();
+        state.savedScore = {};
+        const msg = `IDB SpicyLyrics purgée (${deleted} store(s) vidé(s)) + cache mémoire réinitialisé`;
+        log(msg);
+        uiAddLog(msg, 'warn');
+        Spicetify?.showNotification?.('[LyricsSaver] IDB purgée — rechargement des paroles…');
+        setTimeout(() => forceCurrentTrack(), 800);
+        return deleted;
       },
 
       // Dump l'objet global SpicyLyrics (window.SpicyLyrics)
