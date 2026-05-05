@@ -182,7 +182,7 @@
      Sauvegarde la réponse brute de l'endpoint Spotify
   ═══════════════════════════════════════════════════════════ */
   function exportRaw(trackInfo, rawData) {
-    const filename = `${sanitize(trackInfo.artistName)} - ${sanitize(trackInfo.trackName)}.json`;
+    const filename = `${sanitize(trackInfo.artistName)} - ${sanitize(trackInfo.trackName)}-line.json`;
     const content  = JSON.stringify(rawData, null, 2);
 
     log.group(`Export RAW → ${filename}`);
