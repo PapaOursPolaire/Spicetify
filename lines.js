@@ -223,7 +223,7 @@
     const { raw, parsed: lyrics } = result;
 
     exportRaw(ti, raw);
-    exportLRC(ti, lyrics);
+    setTimeout(() => exportLRC(ti, lyrics), 500);
     state.savedTrackIds.add(ti.trackId);
     state.totalSaved++;
 
