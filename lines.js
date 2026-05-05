@@ -100,7 +100,8 @@
       log.group('Payload brut');
       log.info(data);
       log.end();
-      return parseLyrics(data);
+      const parsed = parseLyrics(data);
+      return parsed ? { raw: data, parsed } : null;
     } catch (e) {
       log.error('fetchLyrics réseau:', e);
       uiAddLog('⚠ Erreur réseau', 'warn');
@@ -177,8 +178,27 @@
   }
 
   /* ═══════════════════════════════════════════════════════════
-     PIPELINE
+     EXPORT RAW JSON
+     Sauvegarde la réponse brute de l'endpoint Spotify
   ═══════════════════════════════════════════════════════════ */
+  function exportRaw(trackInfo, rawData) {
+    const filename = `${sanitize(trackInfo.artistName)} - ${sanitize(trackInfo.trackName)}.json`;
+    const content  = JSON.stringify(rawData, null, 2);
+
+    log.group(`Export RAW → ${filename}`);
+    log.info(`Taille payload: ${content.length} caractères`);
+    log.end();
+
+    const blob = new Blob([content], { type: 'application/json;charset=utf-8' });
+    const url  = URL.createObjectURL(blob);
+    const a    = Object.assign(document.createElement('a'), { href: url, download: filename });
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 300);
+  }
+
+
   async function processTrack(ti, { force = false } = {}) {
     log.group(`processTrack: ${ti.artistName} — ${ti.trackName}`);
     log.info(`trackId: ${ti.trackId} | force: ${force} | déjà sauvegardé: ${state.savedTrackIds.has(ti.trackId)}`);
@@ -190,9 +210,9 @@
     }
 
     uiSetStatus('fetching');
-    const lyrics = await fetchLyrics(ti.trackId);
+    const result = await fetchLyrics(ti.trackId);
 
-    if (!lyrics) {
+    if (!result) {
       log.warn(`Aucune parole exploitable pour "${ti.trackName}"`);
       log.end();
       uiAddLog(`✗ Pas de paroles — ${ti.trackName}`, 'warn');
@@ -200,6 +220,9 @@
       return;
     }
 
+    const { raw, parsed: lyrics } = result;
+
+    exportRaw(ti, raw);
     exportLRC(ti, lyrics);
     state.savedTrackIds.add(ti.trackId);
     state.totalSaved++;
@@ -210,7 +233,7 @@
     const st = document.getElementById('llSyncType');
     if (st) st.textContent = lyrics.syncType === 'LINE_SYNCED' ? 'LINE' : 'NONE';
 
-    uiAddLog(`✓ ${ti.artistName} — ${ti.trackName} [${lyrics.syncType}]`, 'success');
+    uiAddLog(`✓ ${ti.artistName} — ${ti.trackName} [${lyrics.syncType}] · .json + .lrc`, 'success');
     uiSetStatus('idle');
     uiUpdateCount();
     Spicetify?.showNotification?.(`[LineLyrics] ✓ ${ti.trackName}`);
@@ -410,7 +433,7 @@
     buildUI();
     setupPlayerEvents();
     uiSetStatus('idle');
-    uiAddLog('Prêt — .lrc auto-save actif', 'success');
+    uiAddLog('Prêt — .json + .lrc auto-save actif', 'success');
     Spicetify?.showNotification?.('[LineLyrics] Prêt ✓');
     window.LineLyrics = {
       config    : CONFIG,
@@ -418,7 +441,7 @@
       forceNow  : () => { const ti = getCurrentTrackInfo(); if (ti) { state.savedTrackIds.delete(ti.trackId); processTrack(ti, { force: true }); } },
       clearSaved: () => { state.savedTrackIds.clear(); log.info('Cache vidé via API'); uiAddLog('Cache vidé', 'info'); },
     };
-    log.info('LineLyrics v2.0 actif | panel: haut-droite | format: .lrc');
+    log.info('LineLyrics v2.0 actif | panel: haut-droite | formats: .json + .lrc');
   }
 
   let attempts = 0;
