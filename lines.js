@@ -1,6 +1,7 @@
-// spotify-line-lyrics.js — v2.0
+// spotify-line-lyrics.js — v2.1
 // Paroles LINE-sync via endpoint natif Spotify | Sortie : .lrc | Auto à chaque piste
 // Panel : haut-droite, réduit par défaut | Logs détaillés dans la console
+// Cache persistant via localStorage — pas de re-téléchargement entre sessions
 
 (function () {
   'use strict';
@@ -11,13 +12,43 @@
   const CONFIG = {
     debug             : true,
     deduplicateByTrack: true,
+    storageKey        : 'LineLyrics_savedIds',   // clé localStorage
+    maxCacheSize      : 5000,                     // nb max de trackId en cache
   };
 
   /* ═══════════════════════════════════════════════════════════
      STATE
   ═══════════════════════════════════════════════════════════ */
+  /* ═══════════════════════════════════════════════════════════
+     CACHE PERSISTANT (localStorage)
+  ═══════════════════════════════════════════════════════════ */
+  const persistentCache = {
+    _load() {
+      try {
+        const raw = localStorage.getItem(CONFIG.storageKey);
+        return raw ? new Set(JSON.parse(raw)) : new Set();
+      } catch (e) { log.warn('persistentCache._load:', e); return new Set(); }
+    },
+    _save(set) {
+      try {
+        // Limiter la taille : supprimer les entrées les plus anciennes si besoin
+        let ids = [...set];
+        if (ids.length > CONFIG.maxCacheSize) {
+          ids = ids.slice(ids.length - CONFIG.maxCacheSize);
+        }
+        localStorage.setItem(CONFIG.storageKey, JSON.stringify(ids));
+      } catch (e) { log.warn('persistentCache._save:', e); }
+    },
+    has(id)    { return this._set.has(id); },
+    add(id)    { this._set.add(id); this._save(this._set); },
+    delete(id) { this._set.delete(id); this._save(this._set); },
+    clear()    { this._set.clear(); localStorage.removeItem(CONFIG.storageKey); },
+    get size() { return this._set.size; },
+    _set: null,   // initialisé dans init()
+  };
+
   const state = {
-    savedTrackIds: new Set(),
+    savedTrackIds: persistentCache,   // même interface que Set
     totalSaved   : 0,
   };
 
@@ -357,8 +388,8 @@
     };
     document.getElementById('llClearBtn').onclick = () => {
       state.savedTrackIds.clear();
-      log.info('Cache vidé manuellement');
-      uiAddLog('Cache vidé', 'info');
+      log.info('Cache persistant vidé manuellement');
+      uiAddLog(`Cache vidé (${persistentCache.size === 0 ? 'OK' : '?'})`, 'info');
     };
     document.getElementById('llCbDedup').onchange = e => {
       CONFIG.deduplicateByTrack = e.target.checked;
@@ -430,6 +461,9 @@
      INIT
   ═══════════════════════════════════════════════════════════ */
   function activate() {
+    // Charger le cache persistant depuis localStorage
+    persistentCache._set = persistentCache._load();
+    log.info(`Cache persistant chargé — ${persistentCache.size} piste(s) déjà sauvegardée(s)`);
     buildUI();
     setupPlayerEvents();
     uiSetStatus('idle');
@@ -439,9 +473,9 @@
       config    : CONFIG,
       state,
       forceNow  : () => { const ti = getCurrentTrackInfo(); if (ti) { state.savedTrackIds.delete(ti.trackId); processTrack(ti, { force: true }); } },
-      clearSaved: () => { state.savedTrackIds.clear(); log.info('Cache vidé via API'); uiAddLog('Cache vidé', 'info'); },
+      clearSaved: () => { state.savedTrackIds.clear(); log.info('Cache persistant vidé via API'); uiAddLog('Cache vidé', 'info'); },
     };
-    log.info('LineLyrics v2.0 actif | panel: haut-droite | formats: .json + .lrc');
+    log.info('LineLyrics v2.1 actif | panel: haut-droite | formats: .json + .lrc | cache: localStorage');
   }
 
   let attempts = 0;
